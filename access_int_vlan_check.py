@@ -9,7 +9,8 @@ DESCRIPTION:
     Interfaces in CloudVision Studios.
 
     It reads a CSV of port mappings, validates that all required VLANs exist 
-    in the topology studio, merges new configuration with existing 
+    in the topology studio, intelligently discovers Access-Pods (even those 
+    with 0 configured interfaces), merges new configuration with existing 
     Studio data, creates a new workspace, and builds the changes.
     Changes need to be reviewed and accepted then pushed via a Change Control.
 
@@ -63,10 +64,15 @@ CSV STRUCTURE REQUIREMENTS:
     - Description:  (Optional) Interface description.
 
 MAPPING LOGIC:
-    - If Mode is 'trunk': skips trunk interface configuration - this should be done manually.
+    - If Mode is 'trunk': Uses generic 'TRUNK_DEFAULT' profile (Allow All).
     - If Mode is 'access' and Voice VLAN exists: Uses 'trunk phone' mode.
     - If Mode is 'access' and NO Voice VLAN: Uses 'access' mode.
 
+VERSION HISTORY:
+    v1.3 (2025-02-04): Enhanced with tag-based fallback for empty pods
+    v1.2: Added VLAN validation and port profile auto-generation
+    v1.1: Safe merge with existing data, multiple pod support
+    v1.0: Initial release
 
 ================================================================================
 """
@@ -90,9 +96,10 @@ try:
 except ImportError as e:
     print(f"\n[!] Missing Dependency: {e.name}")
     sys.exit(1)
- 
-CV_TOKEN = "CVP_TOKEN"
-CV_ADDR = "CVP_HOSTNAME"
+
+CV_TOKEN = "TOKEN"
+CV_ADDR = "CVP_IP" 
+
 INTERFACE_STUDIO_ID = "studio-campus-access-interfaces"
 
 def print_header(text):
@@ -170,11 +177,17 @@ def build_profile_object(row):
     return p_obj
 
 def get_device_tags(channel):
-    """Get ALL tags for all devices - returns device_id -> {tag_type: tag_value}"""
+    """Get ALL tags for all devices - returns device_id -> {tag_type: tag_value}
+    Only reads COMMITTED tags (workspace_id="")"""
     stub = tag_services.TagAssignmentServiceStub(channel)
     device_tags = defaultdict(dict)
     
     for resp in stub.GetAll(tag_services.TagAssignmentStreamRequest()):
+        workspace_id = resp.value.key.workspace_id.value
+        
+        if workspace_id != "":
+            continue
+        
         device_id = resp.value.key.device_id.value
         label = resp.value.key.label.value
         value = resp.value.key.value.value
@@ -490,6 +503,7 @@ def main():
     print_header("PHASE 2: PROCESSING CSV")
     interfaces_by_pod = defaultdict(list)
     trunk_ports = []
+    device_campus_pod_map = {}
     
     for row in csv_data:
         switch = str(row['New_Switch']).strip()
@@ -508,6 +522,9 @@ def main():
         
         device_id, tags = matches[0]
         pod_name = tags.get('Access-Pod', 'Unknown')
+        
+        if pod_name not in device_campus_pod_map:
+            device_campus_pod_map[pod_name] = tags.get('Campus-Pod', 'Unknown')
         
         interface_data = {
             "tags": {"query": f"interface:Ethernet{port}@{device_id}"},
@@ -557,8 +574,14 @@ def main():
     campus_list = existing_data.get("campus", [])
     
     for c, campus in enumerate(campus_list):
+        campus_tag = campus.get("tags", {}).get("query", "")
+        campus_name = campus_tag.replace("Campus:", "") if campus_tag else f"campus{c}"
+        
         cpods = campus.get("inputs", {}).get("campusPod", [])
         for cp, cpod in enumerate(cpods):
+            cpod_tag = cpod.get("tags", {}).get("query", "")
+            cpod_name = cpod_tag.replace("Campus-Pod:", "") if cpod_tag else f"pod{cp}"
+            
             apods = cpod.get("inputs", {}).get("accessPod", [])
             for ap, apod in enumerate(apods):
                 apod_tag = apod.get("tags", {}).get("query", "")
@@ -569,7 +592,9 @@ def main():
                         "location": (c, cp, ap),
                         "pod_name": pod_name,
                         "total_interfaces": interface_count,
-                        "tag": apod_tag
+                        "tag": apod_tag,
+                        "campus_name": campus_name,
+                        "campusPod_name": cpod_name
                     })
     
     if not found_pods:
@@ -623,24 +648,112 @@ def main():
     for pod in found_pods:
         c, cp, ap = pod["location"]
         status = " [WILL CREATE]" if pod.get("needs_creation") else ""
-        print(f"      campus/{c}/campusPod/{cp}/accessPod/{ap}: {pod['tag']} ({pod['total_interfaces']} interfaces){status}")
+        campus_name = pod.get("campus_name", "?")
+        cpod_name = pod.get("campusPod_name", "?")
+        print(f"      campus/{c}/campusPod/{cp}/accessPod/{ap}: Campus={campus_name}, Campus-Pod={cpod_name} ({pod['total_interfaces']} interfaces){status}")
     
     if len(found_pods) > 1:
-        print(f"\n    ⚠ Multiple pods found with the same tag!")
-        for i, pod in enumerate(found_pods, 1):
-            c, cp, ap = pod["location"]
-            print(f"    [{i}] campus/{c}/campusPod/{cp}/accessPod/{ap}")
-            print(f"        Existing interfaces: {pod['total_interfaces']}")
+        expected_campusPod = device_campus_pod_map.get(pod_name, None)
         
-        choice = input(f"\n    Which pod? [1-{len(found_pods)}]: ").strip()
-        try:
-            pod_idx = int(choice) - 1
-            if pod_idx < 0 or pod_idx >= len(found_pods):
-                print("Invalid choice")
-                return
-        except:
-            print("Invalid input")
-            return
+        if expected_campusPod:
+            print(f"\n    ℹ Devices in CSV have Campus-Pod tag: {expected_campusPod}")
+            print(f"    Filtering pods to match this Campus-Pod...")
+            
+            matching_pods = [p for p in found_pods if p.get("campusPod_name") == expected_campusPod]
+            
+            if len(matching_pods) == 1:
+                print(f"    ✓ Auto-selected matching pod: Campus-Pod={expected_campusPod}")
+                found_pods = matching_pods
+            elif len(matching_pods) > 1:
+                print(f"    ⚠ Found {len(matching_pods)} pods in Campus-Pod={expected_campusPod}")
+                found_pods = matching_pods
+            else:
+                print(f"    ⚠ No pods match Campus-Pod={expected_campusPod}")
+                print(f"    This might be stale studio data. Please select manually:")
+        
+        if len(found_pods) > 1:
+            print(f"\n    ⚠ Multiple pods found with same Access-Pod tag!")
+            print(f"    Checking device Campus and Campus-Pod tags to determine correct location...")
+            
+            csv_device_campus = None
+            csv_device_cpod = None
+            for hostname, (device_id, pod_name_check) in hostname_to_device.items():
+                matches = find_devices_by_hostname(device_tags, hostname)
+                if matches:
+                    _, tags = matches[0]
+                    csv_device_campus = tags.get('Campus')
+                    csv_device_cpod = tags.get('Campus-Pod')
+                    if csv_device_campus and csv_device_cpod:
+                        break
+            
+            if csv_device_campus and csv_device_cpod:
+                print(f"    Current device tags: Campus={csv_device_campus}, Campus-Pod={csv_device_cpod}")
+            
+            pods_with_interfaces = [p for p in found_pods if p['total_interfaces'] > 0]
+            auto_select = None
+            
+            for i, pod in enumerate(found_pods, 1):
+                c, cp, ap = pod["location"]
+                campus_name = pod.get("campus_name", f"campus{c}")
+                cpod_name = pod.get("campusPod_name", f"pod{cp}")
+                
+                match_indicator = ""
+                campus_match = csv_device_campus and campus_name == csv_device_campus
+                cpod_match = csv_device_cpod and cpod_name == csv_device_cpod
+                
+                if campus_match and cpod_match:
+                    match_indicator = " ← DEVICE TAGS MATCH (Current Location)"
+                    if auto_select is None:
+                        auto_select = i - 1
+                elif pod['total_interfaces'] > 0:
+                    match_indicator = f" ← HAS {pod['total_interfaces']} INTERFACES (Old Config?)"
+                
+                print(f"    [{i}] Campus: {campus_name} / Campus-Pod: {cpod_name}{match_indicator}")
+                print(f"        Location: campus/{c}/campusPod/{cp}/accessPod/{ap}")
+                print(f"        Existing interfaces: {pod['total_interfaces']}")
+            
+            if pods_with_interfaces and auto_select is not None:
+                old_pod = pods_with_interfaces[0]
+                new_cpod = csv_device_cpod
+                old_cpod = old_pod.get("campusPod_name")
+                
+                if old_cpod != new_cpod:
+                    print(f"\n    ⚠ WARNING: Possible pod migration detected!")
+                    print(f"    - Old location (has config): Campus-Pod={old_cpod}")
+                    print(f"    - New location (device tags): Campus-Pod={new_cpod}")
+                    print(f"\n    This typically means switches were moved between Campus-Pods.")
+                    print(f"    Choose where to place the new configuration:")
+                    print(f"    - Option {auto_select + 1}: New location (device tags) - Recommended")
+                    print(f"    - Other options: Add to existing configuration")
+                    
+                    choice = input(f"\n    Which pod? [1-{len(found_pods)}]: ").strip()
+                    try:
+                        pod_idx = int(choice) - 1
+                        if pod_idx < 0 or pod_idx >= len(found_pods):
+                            print("Invalid choice")
+                            return
+                    except:
+                        print("Invalid input")
+                        return
+                else:
+                    print(f"\n    ✓ Auto-selecting option {auto_select + 1} (matches current device tags)")
+                    pod_idx = auto_select
+            elif auto_select is not None:
+                print(f"\n    ✓ Auto-selecting option {auto_select + 1} (matches current device tags)")
+                pod_idx = auto_select
+            else:
+                print(f"\n    ⚠ Could not auto-select based on device tags")
+                choice = input(f"\n    Which pod? [1-{len(found_pods)}]: ").strip()
+                try:
+                    pod_idx = int(choice) - 1
+                    if pod_idx < 0 or pod_idx >= len(found_pods):
+                        print("Invalid choice")
+                        return
+                except:
+                    print("Invalid input")
+                    return
+        else:
+            pod_idx = 0
     else:
         pod_idx = 0
     
