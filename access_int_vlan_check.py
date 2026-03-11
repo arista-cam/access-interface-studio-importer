@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.3 (ENHANCED - TAG FALLBACK)
+ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.3
 ================================================================================
 
 DESCRIPTION:
@@ -98,7 +98,7 @@ except ImportError as e:
     sys.exit(1)
 
 CV_TOKEN = "TOKEN"
-CV_ADDR = "CVP_IP" 
+CV_ADDR = "CVP_IP"
 
 INTERFACE_STUDIO_ID = "studio-campus-access-interfaces"
 
@@ -429,11 +429,122 @@ def validate_vlans_in_topology(csv_data, topology_vlans):
     print_done(f"Passed ({len(required_vlans)} VLANs verified)")
     return True
 
+def locate_pod_in_studio(grpc_channel, pod_name, existing_data, device_tags, device_campus_pod_map):
+    """
+    Locate a single pod in the studio and return its details.
+    Returns: dict with location, existing_count, needs_creation, or None if error
+    """
+    found_pods = []
+    campus_list = existing_data.get("campus", [])
+    
+    for c, campus in enumerate(campus_list):
+        campus_tag = campus.get("tags", {}).get("query", "")
+        campus_name = campus_tag.replace("Campus:", "") if campus_tag else f"campus{c}"
+        
+        cpods = campus.get("inputs", {}).get("campusPod", [])
+        for cp, cpod in enumerate(cpods):
+            cpod_tag = cpod.get("tags", {}).get("query", "")
+            cpod_name = cpod_tag.replace("Campus-Pod:", "") if cpod_tag else f"pod{cp}"
+            
+            apods = cpod.get("inputs", {}).get("accessPod", [])
+            for ap, apod in enumerate(apods):
+                apod_tag = apod.get("tags", {}).get("query", "")
+                interface_count = len(apod.get("inputs", {}).get("interfaces", []))
+                
+                if apod_tag == f"Access-Pod:{pod_name}":
+                    found_pods.append({
+                        "location": (c, cp, ap),
+                        "pod_name": pod_name,
+                        "total_interfaces": interface_count,
+                        "tag": apod_tag,
+                        "campus_name": campus_name,
+                        "campusPod_name": cpod_name
+                    })
+    
+    if not found_pods:
+        exists, device_count, sample_device = verify_pod_exists_in_tags(grpc_channel, pod_name)
+        
+        if not exists:
+            print(f"\n[!] ERROR: Pod '{pod_name}' does not exist in device tags!")
+            return None
+        
+        hierarchy = find_pod_hierarchy_from_device(grpc_channel, sample_device, existing_data)
+        
+        if not hierarchy:
+            print(f"\n[!] ERROR: Could not determine location for pod '{pod_name}'")
+            return None
+        
+        c_idx, cp_idx, ap_idx = hierarchy
+        
+        return {
+            "location": (c_idx, cp_idx, ap_idx),
+            "pod_name": pod_name,
+            "total_interfaces": 0,
+            "needs_creation": True
+        }
+    
+    if len(found_pods) > 1:
+        expected_campusPod = device_campus_pod_map.get(pod_name, None)
+        
+        if expected_campusPod:
+            matching_pods = [p for p in found_pods if p.get("campusPod_name") == expected_campusPod]
+            
+            if len(matching_pods) == 1:
+                found_pods = matching_pods
+            elif len(matching_pods) > 1:
+                found_pods = matching_pods
+        
+        if len(found_pods) > 1:
+            found_pods = [found_pods[0]]
+    
+    return found_pods[0]
+
+def validate_vlans_in_topology(csv_data, topology_vlans):
+    """Validate that required VLANs exist in the AVD Campus Topology"""
+    import re
+    
+    print_step("Validating VLANs against topology design")
+    
+    required_vlans = set()
+    
+    for row in csv_data:
+        mode_col = str(row.get('Mode', '')).strip().lower()
+        if mode_col == "trunk":
+            continue
+        
+        for col in ['Access', 'Voice']:
+            val = clean_int_str(str(row.get(col, '')).strip())
+            if val and val.isdigit():
+                vlan = int(val)
+                if vlan != 1:
+                    required_vlans.add(vlan)
+        
+        profile = str(row.get('Port Profile', ''))
+        for m in re.findall(r'[AV](\d+)', profile):
+            vlan = int(m)
+            if vlan != 1:
+                required_vlans.add(vlan)
+    
+    missing = required_vlans - topology_vlans
+    
+    if missing:
+        print_done("FAILED")
+        print("\n" + "!"*80)
+        print("  CRITICAL VALIDATION FAILURE: MISSING VLANS IN TOPOLOGY")
+        print("!"*80)
+        print(f"\n  The following VLANs are not defined in the AVD Campus Topology studio:")
+        print(f"  {', '.join([str(v) for v in sorted(missing)])}")
+        print(f"\n  Please add these VLANs to the topology before configuring interfaces.")
+        print("!"*80)
+        return False
+    
+    print_done(f"Passed ({len(required_vlans)} VLANs verified)")
+    return True
+
 def main():
     import os
     
-    print_header("ARISTA IMPORTER - ENHANCED VERSION")
-    print("  ENHANCEMENT: Tag-based fallback for pods with 0 interfaces")
+    print_header("ARISTA IMPORTER")
     
     csv_dir = "./CSV"
     CSV_FILE = None
@@ -560,227 +671,50 @@ def main():
         print("\n    Aborting due to missing VLANs")
         return
     
-    print_header("PHASE 3: LOCATE POD IN STUDIO")
+    print_header("PHASE 3: LOCATE PODS IN STUDIO")
     
     print_step("Reading interface studio")
     existing_data = get_existing_studio_data(grpc_channel)
     print_done()
     
-    pod_name = list(interfaces_by_pod.keys())[0]
+    print(f"\n  Locating {len(interfaces_by_pod)} Access-Pods in studio...")
     
-    print_step(f"Finding studio pod: Access-Pod:{pod_name}")
+    pod_locations = {}
     
-    found_pods = []
-    campus_list = existing_data.get("campus", [])
-    
-    for c, campus in enumerate(campus_list):
-        campus_tag = campus.get("tags", {}).get("query", "")
-        campus_name = campus_tag.replace("Campus:", "") if campus_tag else f"campus{c}"
+    for pod_name in interfaces_by_pod.keys():
+        print(f"\n  [{pod_name}]")
+        pod_info = locate_pod_in_studio(grpc_channel, pod_name, existing_data, device_tags, device_campus_pod_map)
         
-        cpods = campus.get("inputs", {}).get("campusPod", [])
-        for cp, cpod in enumerate(cpods):
-            cpod_tag = cpod.get("tags", {}).get("query", "")
-            cpod_name = cpod_tag.replace("Campus-Pod:", "") if cpod_tag else f"pod{cp}"
-            
-            apods = cpod.get("inputs", {}).get("accessPod", [])
-            for ap, apod in enumerate(apods):
-                apod_tag = apod.get("tags", {}).get("query", "")
-                interface_count = len(apod.get("inputs", {}).get("interfaces", []))
-                
-                if apod_tag == f"Access-Pod:{pod_name}":
-                    found_pods.append({
-                        "location": (c, cp, ap),
-                        "pod_name": pod_name,
-                        "total_interfaces": interface_count,
-                        "tag": apod_tag,
-                        "campus_name": campus_name,
-                        "campusPod_name": cpod_name
-                    })
-    
-    if not found_pods:
-        print_done("Not found in studio")
-        
-        print(f"\n    ⚠ Pod 'Access-Pod:{pod_name}' not found in studio inputs")
-        print(f"    This usually means the pod has 0 configured interfaces")
-        
-        print_step("Checking if pod exists via device tags")
-        exists, device_count, sample_device = verify_pod_exists_in_tags(grpc_channel, pod_name)
-        
-        if not exists:
-            print_done("FAILED")
-            print(f"\n[!] ERROR: Pod '{pod_name}' does not exist in device tags either!")
-            print(f"    No devices have the tag 'Access-Pod:{pod_name}'")
-            print(f"    Please verify the pod name is correct.")
+        if not pod_info:
+            print(f"    ✗ Failed to locate pod '{pod_name}' - aborting")
             return
         
-        print_done(f"Found ({device_count} devices)")
+        c_idx, cp_idx, ap_idx = pod_info["location"]
+        existing_count = pod_info.get("total_interfaces", 0)
+        needs_creation = pod_info.get("needs_creation", False)
         
-        print(f"\n    ✓ Pod exists in device tags: {device_count} devices tagged")
-        print(f"    ⚙ Pod has 0 configured interfaces - will start from interface index 0")
+        print(f"    Location: campus/{c_idx}/campusPod/{cp_idx}/accessPod/{ap_idx}")
+        print(f"    Existing interfaces: {existing_count}")
+        print(f"    Will add: {len(interfaces_by_pod[pod_name])} interfaces")
         
-        print_step("Determining pod hierarchy from device tags")
-        hierarchy = find_pod_hierarchy_from_device(grpc_channel, sample_device, existing_data)
+        if needs_creation:
+            print(f"    Status: Will create new pod structure")
         
-        if not hierarchy:
-            print_done("FAILED")
-            print(f"\n[!] ERROR: Could not determine campus/campusPod location for this pod")
-            print(f"    Tried querying Campus and Campus-Pod tags from device {sample_device}")
-            print(f"    Please verify device tags are correct.")
-            return
-        
-        c_idx, cp_idx, ap_idx = hierarchy
-        print_done(f"campus/{c_idx}/campusPod/{cp_idx}/accessPod/{ap_idx}")
-        
-        found_pods = [{
-            "location": (c_idx, cp_idx, ap_idx),
-            "pod_name": pod_name,
-            "total_interfaces": 0,
-            "tag": f"Access-Pod:{pod_name}",
-            "needs_creation": True
-        }]
-        
-        print(f"\n    ✓ Will create pod at: campus/{c_idx}/campusPod/{cp_idx}/accessPod/{ap_idx}")
-        print(f"    ✓ Starting interface count: 0")
-    else:
-        print_done(f"({len(found_pods)} found)")
+        pod_locations[pod_name] = pod_info
     
-    print(f"\n    Pods with exact tag 'Access-Pod:{pod_name}':")
-    for pod in found_pods:
-        c, cp, ap = pod["location"]
-        status = " [WILL CREATE]" if pod.get("needs_creation") else ""
-        campus_name = pod.get("campus_name", "?")
-        cpod_name = pod.get("campusPod_name", "?")
-        print(f"      campus/{c}/campusPod/{cp}/accessPod/{ap}: Campus={campus_name}, Campus-Pod={cpod_name} ({pod['total_interfaces']} interfaces){status}")
+    total_interfaces_to_add = sum(len(v) for v in interfaces_by_pod.values())
+    total_existing = sum(pod_locations[p].get("total_interfaces", 0) for p in interfaces_by_pod.keys())
     
-    if len(found_pods) > 1:
-        expected_campusPod = device_campus_pod_map.get(pod_name, None)
-        
-        if expected_campusPod:
-            print(f"\n    ℹ Devices in CSV have Campus-Pod tag: {expected_campusPod}")
-            print(f"    Filtering pods to match this Campus-Pod...")
-            
-            matching_pods = [p for p in found_pods if p.get("campusPod_name") == expected_campusPod]
-            
-            if len(matching_pods) == 1:
-                print(f"    ✓ Auto-selected matching pod: Campus-Pod={expected_campusPod}")
-                found_pods = matching_pods
-            elif len(matching_pods) > 1:
-                print(f"    ⚠ Found {len(matching_pods)} pods in Campus-Pod={expected_campusPod}")
-                found_pods = matching_pods
-            else:
-                print(f"    ⚠ No pods match Campus-Pod={expected_campusPod}")
-                print(f"    This might be stale studio data. Please select manually:")
-        
-        if len(found_pods) > 1:
-            print(f"\n    ⚠ Multiple pods found with same Access-Pod tag!")
-            print(f"    Checking device Campus and Campus-Pod tags to determine correct location...")
-            
-            csv_device_campus = None
-            csv_device_cpod = None
-            for hostname, (device_id, pod_name_check) in hostname_to_device.items():
-                matches = find_devices_by_hostname(device_tags, hostname)
-                if matches:
-                    _, tags = matches[0]
-                    csv_device_campus = tags.get('Campus')
-                    csv_device_cpod = tags.get('Campus-Pod')
-                    if csv_device_campus and csv_device_cpod:
-                        break
-            
-            if csv_device_campus and csv_device_cpod:
-                print(f"    Current device tags: Campus={csv_device_campus}, Campus-Pod={csv_device_cpod}")
-            
-            pods_with_interfaces = [p for p in found_pods if p['total_interfaces'] > 0]
-            auto_select = None
-            
-            for i, pod in enumerate(found_pods, 1):
-                c, cp, ap = pod["location"]
-                campus_name = pod.get("campus_name", f"campus{c}")
-                cpod_name = pod.get("campusPod_name", f"pod{cp}")
-                
-                match_indicator = ""
-                campus_match = csv_device_campus and campus_name == csv_device_campus
-                cpod_match = csv_device_cpod and cpod_name == csv_device_cpod
-                
-                if campus_match and cpod_match:
-                    match_indicator = " ← DEVICE TAGS MATCH (Current Location)"
-                    if auto_select is None:
-                        auto_select = i - 1
-                elif pod['total_interfaces'] > 0:
-                    match_indicator = f" ← HAS {pod['total_interfaces']} INTERFACES (Old Config?)"
-                
-                print(f"    [{i}] Campus: {campus_name} / Campus-Pod: {cpod_name}{match_indicator}")
-                print(f"        Location: campus/{c}/campusPod/{cp}/accessPod/{ap}")
-                print(f"        Existing interfaces: {pod['total_interfaces']}")
-            
-            if pods_with_interfaces and auto_select is not None:
-                old_pod = pods_with_interfaces[0]
-                new_cpod = csv_device_cpod
-                old_cpod = old_pod.get("campusPod_name")
-                
-                if old_cpod != new_cpod:
-                    print(f"\n    ⚠ WARNING: Possible pod migration detected!")
-                    print(f"    - Old location (has config): Campus-Pod={old_cpod}")
-                    print(f"    - New location (device tags): Campus-Pod={new_cpod}")
-                    print(f"\n    This typically means switches were moved between Campus-Pods.")
-                    print(f"    Choose where to place the new configuration:")
-                    print(f"    - Option {auto_select + 1}: New location (device tags) - Recommended")
-                    print(f"    - Other options: Add to existing configuration")
-                    
-                    choice = input(f"\n    Which pod? [1-{len(found_pods)}]: ").strip()
-                    try:
-                        pod_idx = int(choice) - 1
-                        if pod_idx < 0 or pod_idx >= len(found_pods):
-                            print("Invalid choice")
-                            return
-                    except:
-                        print("Invalid input")
-                        return
-                else:
-                    print(f"\n    ✓ Auto-selecting option {auto_select + 1} (matches current device tags)")
-                    pod_idx = auto_select
-            elif auto_select is not None:
-                print(f"\n    ✓ Auto-selecting option {auto_select + 1} (matches current device tags)")
-                pod_idx = auto_select
-            else:
-                print(f"\n    ⚠ Could not auto-select based on device tags")
-                choice = input(f"\n    Which pod? [1-{len(found_pods)}]: ").strip()
-                try:
-                    pod_idx = int(choice) - 1
-                    if pod_idx < 0 or pod_idx >= len(found_pods):
-                        print("Invalid choice")
-                        return
-                except:
-                    print("Invalid input")
-                    return
-        else:
-            pod_idx = 0
-    else:
-        pod_idx = 0
+    print(f"\n  Summary:")
+    print(f"    Total pods: {len(interfaces_by_pod)}")
+    print(f"    Total existing interfaces: {total_existing}")
+    print(f"    Total new interfaces: {total_interfaces_to_add}")
+    print(f"    Total after import: {total_existing + total_interfaces_to_add}")
     
-    found_pod = found_pods[pod_idx]
-    
-    c_idx, cp_idx, ap_idx = found_pod["location"]
-    existing_count = found_pod["total_interfaces"]
-    needs_creation = found_pod.get("needs_creation", False)
-    
-    print(f"\n    ✓ Target: {found_pod['pod_name']}")
-    print(f"    ✓ Location: campus/{c_idx}/campusPod/{cp_idx}/accessPod/{ap_idx}")
-    print(f"    ✓ Current interfaces: {existing_count}")
-    print(f"    ✓ Will add: {len(interfaces_by_pod[pod_name])} interfaces")
-    
-    if existing_count > 0:
-        print(f"\n    ⚠ WARNING: This pod already has {existing_count} interfaces!")
-        print(f"    ⚠ New interfaces will be ADDED (not replaced)")
-        confirm = input(f"    Continue? (y/n): ").strip().lower()
-        if confirm != 'y':
-            print("    Aborted")
-            return
-    elif needs_creation:
-        print(f"\n    ℹ This pod will be created with its first interfaces")
-        confirm = input(f"    Continue? (y/n): ").strip().lower()
-        if confirm != 'y':
-            print("    Aborted")
-            return
+    confirm = input(f"\n  Continue with import? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("    Aborted")
+        return
     
     print_header("PHASE 3.5: WORKSPACE")
     
@@ -805,44 +739,50 @@ def main():
         print(f"(warning: {e})")
     print_done()
     
-    if needs_creation:
-        print_header("PHASE 3.6: CREATE POD STRUCTURE")
-        
-        print_step(f"Creating Access-Pod structure at accessPod/{ap_idx}")
+    pods_needing_creation = [pn for pn, info in pod_locations.items() if info.get("needs_creation")]
+    
+    if pods_needing_creation:
+        print_header("PHASE 3.6: CREATE POD STRUCTURES")
         
         config_stub = studio_services.InputsConfigServiceStub(grpc_channel)
         
-        pod_structure = {
-            "tags": {"query": f"Access-Pod:{pod_name}"},
-            "inputs": {
-                "interfaces": []
-            }
-        }
-        
-        path_values = [
-            "campus", str(c_idx), "inputs",
-            "campusPod", str(cp_idx), "inputs",
-            "accessPod", str(ap_idx)
-        ]
-        
-        json_request = json.dumps({
-            "values": [{
-                "remove": False,
-                "inputs": json.dumps(pod_structure),
-                "key": {
-                    "studioId": INTERFACE_STUDIO_ID,
-                    "workspaceId": ws_id,
-                    "path": {"values": path_values}
+        for pod_name in pods_needing_creation:
+            pod_info = pod_locations[pod_name]
+            c_idx, cp_idx, ap_idx = pod_info["location"]
+            
+            print_step(f"Creating {pod_name} at accessPod/{ap_idx}")
+            
+            pod_structure = {
+                "tags": {"query": f"Access-Pod:{pod_name}"},
+                "inputs": {
+                    "interfaces": []
                 }
-            }]
-        })
-        
-        req = Parse(json_request, studio_services.InputsConfigSetSomeRequest(), False)
-        
-        for response in config_stub.SetSome(req, timeout=30):
-            pass
-        
-        print_done()
+            }
+            
+            path_values = [
+                "campus", str(c_idx), "inputs",
+                "campusPod", str(cp_idx), "inputs",
+                "accessPod", str(ap_idx)
+            ]
+            
+            json_request = json.dumps({
+                "values": [{
+                    "remove": False,
+                    "inputs": json.dumps(pod_structure),
+                    "key": {
+                        "studioId": INTERFACE_STUDIO_ID,
+                        "workspaceId": ws_id,
+                        "path": {"values": path_values}
+                    }
+                }]
+            })
+            
+            req = Parse(json_request, studio_services.InputsConfigSetSomeRequest(), False)
+            
+            for response in config_stub.SetSome(req, timeout=30):
+                pass
+            
+            print_done()
     
     print_header("PHASE 3.7: PORT PROFILES")
     
@@ -908,6 +848,10 @@ def main():
     config_stub = studio_services.InputsConfigServiceStub(grpc_channel)
     
     for target_pod_name, interfaces in interfaces_by_pod.items():
+        pod_info = pod_locations[target_pod_name]
+        c_idx, cp_idx, ap_idx = pod_info["location"]
+        existing_count = pod_info.get("total_interfaces", 0)
+        
         print(f"\n  Writing {len(interfaces)} interfaces to {target_pod_name}")
         print(f"    Target: campus/{c_idx}/campusPod/{cp_idx}/accessPod/{ap_idx}")
         print(f"    Starting from interface index: {existing_count}")
