@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.3
+ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.4
 ================================================================================
 
 DESCRIPTION:
@@ -14,12 +14,19 @@ DESCRIPTION:
     Studio data, creates a new workspace, and builds the changes.
     Changes need to be reviewed and accepted then pushed via a Change Control.
 
+ENHANCEMENT IN v1.4:
+    - Tag Query Safety: Properly quotes tag values containing spaces
+    - Pre-flight Validation: Detects invalid characters (parentheses, quotes)
+      in Access-Pod tag names before attempting import
+    - Robust Tag Parsing: Handles quoted and unquoted tag query formats when
+      matching pods in studio data
+
 ENHANCEMENT IN v1.3:
     - Smart Pod Discovery: Finds Access-Pods WITH or WITHOUT existing interfaces
     - Tag-Based Fallback: When pod not found in studio, queries device tags
     - Auto Pod Creation: Creates pod structure for empty Access-Pods
     - Hierarchy Detection: Determines campus/campusPod location from device tags
-    
+
     This solves the "Pod not found" error for Access-Pods that exist but have
     0 configured interfaces (which don't appear in studio committed state).
 
@@ -69,6 +76,7 @@ MAPPING LOGIC:
     - If Mode is 'access' and NO Voice VLAN: Uses 'access' mode.
 
 VERSION HISTORY:
+    v1.4 (2025-07-03): Tag query quoting, pre-flight validation for invalid chars
     v1.3 (2025-02-04): Enhanced with tag-based fallback for empty pods
     v1.2: Added VLAN validation and port profile auto-generation
     v1.1: Safe merge with existing data, multiple pod support
@@ -129,6 +137,28 @@ def get_inventory_map(channel):
 def clean_int_str(s):
     """Remove .0 from strings like '1674.0'"""
     return s.replace('.0', '') if s else s
+
+INVALID_TAG_QUERY_CHARS = set('()"')
+
+def format_tag_query(label, value):
+    """Build a tag query string, quoting the value if it contains spaces."""
+    if ' ' in value:
+        return f'{label}:"{value}"'
+    return f'{label}:{value}'
+
+def parse_tag_query_value(query, label):
+    """Extract the raw value from a tag query like 'Label:value' or 'Label:"quoted value"'."""
+    prefix = f'{label}:'
+    if not query.startswith(prefix):
+        return None
+    raw = query[len(prefix):]
+    if raw.startswith('"') and raw.endswith('"'):
+        return raw[1:-1]
+    return raw
+
+def validate_tag_value(value):
+    """Return list of invalid characters found in a tag value, or empty list if valid."""
+    return sorted(set(c for c in value if c in INVALID_TAG_QUERY_CHARS))
 
 def build_profile_object(row):
     """Build port-profile object from CSV row. Returns None for trunk ports."""
@@ -270,13 +300,13 @@ def find_pod_hierarchy_from_device(channel, device_id, existing_data):
     
     for c_idx, campus in enumerate(campus_list):
         campus_tag = campus.get("tags", {}).get("query", "")
-        if campus_tag != f"Campus:{campus_name}":
+        if parse_tag_query_value(campus_tag, "Campus") != campus_name:
             continue
-        
+
         cpods = campus.get("inputs", {}).get("campusPod", [])
         for cp_idx, cpod in enumerate(cpods):
             cpod_tag = cpod.get("tags", {}).get("query", "")
-            if cpod_tag != f"Campus-Pod:{campusPod_name}":
+            if parse_tag_query_value(cpod_tag, "Campus-Pod") != campusPod_name:
                 continue
             
             apods = cpod.get("inputs", {}).get("accessPod", [])
@@ -439,19 +469,19 @@ def locate_pod_in_studio(grpc_channel, pod_name, existing_data, device_tags, dev
     
     for c, campus in enumerate(campus_list):
         campus_tag = campus.get("tags", {}).get("query", "")
-        campus_name = campus_tag.replace("Campus:", "") if campus_tag else f"campus{c}"
-        
+        campus_name = parse_tag_query_value(campus_tag, "Campus") or f"campus{c}"
+
         cpods = campus.get("inputs", {}).get("campusPod", [])
         for cp, cpod in enumerate(cpods):
             cpod_tag = cpod.get("tags", {}).get("query", "")
-            cpod_name = cpod_tag.replace("Campus-Pod:", "") if cpod_tag else f"pod{cp}"
-            
+            cpod_name = parse_tag_query_value(cpod_tag, "Campus-Pod") or f"pod{cp}"
+
             apods = cpod.get("inputs", {}).get("accessPod", [])
             for ap, apod in enumerate(apods):
                 apod_tag = apod.get("tags", {}).get("query", "")
                 interface_count = len(apod.get("inputs", {}).get("interfaces", []))
-                
-                if apod_tag == f"Access-Pod:{pod_name}":
+
+                if parse_tag_query_value(apod_tag, "Access-Pod") == pod_name:
                     found_pods.append({
                         "location": (c, cp, ap),
                         "pod_name": pod_name,
@@ -659,8 +689,27 @@ def main():
     
     for pod_name, interfaces in interfaces_by_pod.items():
         print(f"    {pod_name}: {len(interfaces)} interfaces")
-    
-    
+
+    invalid_pods = []
+    for pod_name in interfaces_by_pod.keys():
+        bad_chars = validate_tag_value(pod_name)
+        if bad_chars:
+            invalid_pods.append((pod_name, bad_chars))
+
+    if invalid_pods:
+        print("\n" + "!"*80)
+        print("  CRITICAL: INVALID CHARACTERS IN ACCESS-POD TAG NAMES")
+        print("!"*80)
+        print("\n  CVP tag queries cannot contain: ( ) \"")
+        print("  The following pods have invalid characters that must be fixed in CloudVision:\n")
+        for pod_name, chars in invalid_pods:
+            print(f"    Pod: {pod_name}")
+            print(f"    Invalid chars: {' '.join(repr(c) for c in chars)}")
+        print(f"\n  Please rename these Access-Pod tags in CloudVision to remove")
+        print(f"  parentheses and double quotes, then re-run the script.")
+        print("!"*80)
+        return
+
     print_header("PHASE 2.5: VLAN VALIDATION")
     
     print_step("Reading VLANs from topology studio")
@@ -753,7 +802,7 @@ def main():
             print_step(f"Creating {pod_name} at accessPod/{ap_idx}")
             
             pod_structure = {
-                "tags": {"query": f"Access-Pod:{pod_name}"},
+                "tags": {"query": format_tag_query("Access-Pod", pod_name)},
                 "inputs": {
                     "interfaces": []
                 }
