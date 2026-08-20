@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.4
+ARISTA CLOUDVISION BULK IMPORTER - VERSION 1.5
 ================================================================================
 
 DESCRIPTION:
     This production-ready script automates the provisioning of Campus Access 
     Interfaces in CloudVision Studios.
 
-    It reads a CSV of port mappings, validates that all required VLANs exist 
-    in the topology studio, intelligently discovers Access-Pods (even those 
-    with 0 configured interfaces), merges new configuration with existing 
+    It reads a CSV of port mappings, validates that all required VLANs exist
+    in the topology studio, intelligently discovers Access-Pods (even those
+    with 0 configured interfaces), merges new configuration with existing
     Studio data, creates a new workspace, and builds the changes.
     Changes need to be reviewed and accepted then pushed via a Change Control.
+
+ENHANCEMENT IN v1.5:
+    - VLAN Creation: When missing VLANs are detected, offers to create them
+      from a customer-provided VLAN CSV (VLAN ID + Name columns)
+    - Writes VLANs to the AVD Campus Topology studio for matching Campus-Pods
+    - CSV Header Validation: Validates CSV columns on selection to prevent
+      accidentally choosing the wrong file
+    - Reusable CSV Picker: Extracted file selection into shared function
 
 ENHANCEMENT IN v1.4:
     - Tag Query Safety: Properly quotes tag values containing spaces
@@ -35,7 +43,9 @@ HOW IT WORKS:
        Groups interfaces by their Access-Pod tag value.
     
     2. VLAN Validation: Queries the AVD Campus Topology studio to ensure all
-       required VLANs (Access + Voice) are defined. Aborts if missing.
+       required VLANs (Access + Voice) are defined. If missing, offers to
+       create them from a VLAN CSV (writes to topology studio, then exits
+       so user can review/submit before re-running for interface import).
     
     3. Pod Location (TWO-STAGE):
        - PRIMARY: Queries studio inputs for pods with interfaces
@@ -76,6 +86,7 @@ MAPPING LOGIC:
     - If Mode is 'access' and NO Voice VLAN: Uses 'access' mode.
 
 VERSION HISTORY:
+    v1.5 (2025-08-18): VLAN creation from CSV, CSV header validation
     v1.4 (2025-07-03): Tag query quoting, pre-flight validation for invalid chars
     v1.3 (2025-02-04): Enhanced with tag-based fallback for empty pods
     v1.2: Added VLAN validation and port profile auto-generation
@@ -85,7 +96,7 @@ VERSION HISTORY:
 ================================================================================
 """
 
-import sys, csv, grpc, json, uuid, ssl, time
+import sys, csv, grpc, json, uuid, ssl, time, os, re
 from collections import defaultdict
 from google.protobuf.json_format import Parse
 
@@ -105,10 +116,11 @@ except ImportError as e:
     print(f"\n[!] Missing Dependency: {e.name}")
     sys.exit(1)
 
-CV_TOKEN = "TOKEN"
-CV_ADDR = "CVP_IP"
+CV_TOKEN = "API TOKEN"
+CV_ADDR = "CVP IP ADDRESS"
 
 INTERFACE_STUDIO_ID = "studio-campus-access-interfaces"
+TOPOLOGY_STUDIO_ID = "studio-avd-campus-fabric"
 
 def print_header(text):
     print(f"\n{'='*80}\n  {text}\n{'='*80}")
@@ -162,8 +174,6 @@ def validate_tag_value(value):
 
 def build_profile_object(row):
     """Build port-profile object from CSV row. Returns None for trunk ports."""
-    import re
-    
     mode = str(row.get('Mode', '')).strip().lower()
     if mode == "trunk":
         return None
@@ -379,9 +389,6 @@ def create_workspace(channel):
 
 def get_vlans_from_topology_studio(channel):
     """Get all VLANs defined in the AVD Campus Topology studio"""
-    
-    TOPOLOGY_STUDIO_ID = "studio-avd-campus-fabric"
-    
     stub = studio_services.InputsServiceStub(channel)
     
     req = studio_services.InputsStreamRequest(
@@ -417,47 +424,144 @@ def get_vlans_from_topology_studio(channel):
     
     return vlans
 
-def validate_vlans_in_topology(csv_data, topology_vlans):
-    """Validate that required VLANs exist in the AVD Campus Topology"""
-    import re
-    
-    print_step("Validating VLANs against topology design")
-    
-    required_vlans = set()
-    
-    for row in csv_data:
-        mode_col = str(row.get('Mode', '')).strip().lower()
-        if mode_col == "trunk":
+def get_topology_pod_structure(channel):
+    """Read the topology studio structure and return campus pod info for VLAN creation.
+    Returns dict: campus_pod_name -> {campus_idx, cpod_idx, svi_count, existing_vlan_ids}"""
+    stub = studio_services.InputsServiceStub(channel)
+
+    req = studio_services.InputsStreamRequest(
+        partial_eq_filter=[studio_pb2.Inputs(
+            key=studio_pb2.InputsKey(
+                studio_id=wrappers.StringValue(value=TOPOLOGY_STUDIO_ID),
+                workspace_id=wrappers.StringValue(value=""),
+                path=fmp_dot_wrappers__pb2.RepeatedString(values=[])
+            )
+        )]
+    )
+
+    pod_structure = {}
+
+    for resp in stub.GetAll(req):
+        if not resp.value.key.path.values:
+            topology_data = json.loads(resp.value.inputs.value)
+
+            campus_services = topology_data.get("campusServices", [])
+
+            for c_idx, service_entry in enumerate(campus_services):
+                campus_query = service_entry.get("tags", {}).get("query", "")
+                campus_name = parse_tag_query_value(campus_query, "Campus")
+
+                service_group = service_entry.get("inputs", {}).get("campusServicesGroup", {})
+                campus_pods_services = service_group.get("campusPodsServices", [])
+
+                for cp_idx, cpod_service in enumerate(campus_pods_services):
+                    cpod_query = cpod_service.get("tags", {}).get("query", "")
+                    cpod_name = parse_tag_query_value(cpod_query, "Campus-Pod")
+
+                    if not cpod_name:
+                        continue
+
+                    services = cpod_service.get("inputs", {}).get("services", {})
+                    svis = services.get("svis", [])
+
+                    existing_ids = set()
+                    for svi in svis:
+                        vlan_id = svi.get("id")
+                        if vlan_id:
+                            existing_ids.add(int(vlan_id))
+
+                    pod_structure[cpod_name] = {
+                        "campus_idx": c_idx,
+                        "campus_name": campus_name,
+                        "cpod_idx": cp_idx,
+                        "svi_count": len(svis),
+                        "existing_vlan_ids": existing_ids
+                    }
+
+    return pod_structure
+
+def _write_svi_field(config_stub, ws_id, c_idx, cp_idx, svi_idx, field_name, value):
+    """Write a single SVI field to the topology studio."""
+    path_values = [
+        "campusServices", str(c_idx), "inputs",
+        "campusServicesGroup", "campusPodsServices", str(cp_idx),
+        "inputs", "services", "svis", str(svi_idx), field_name
+    ]
+
+    json_request = json.dumps({
+        "values": [{
+            "remove": False,
+            "inputs": json.dumps(value),
+            "key": {
+                "studioId": TOPOLOGY_STUDIO_ID,
+                "workspaceId": ws_id,
+                "path": {"values": path_values}
+            }
+        }]
+    })
+
+    req = Parse(json_request, studio_services.InputsConfigSetSomeRequest(), False)
+    for response in config_stub.SetSome(req, timeout=30):
+        pass
+
+def create_vlans_in_topology(channel, ws_id, vlans_to_create, topology_pod_info,
+                              target_cpods, vlan_to_access_pods, device_campus_pod_map):
+    """Write missing VLANs to the topology studio for the specified campus pods.
+    vlans_to_create: {vlan_id: name}
+    target_cpods: set of Campus-Pod names to add VLANs to
+    vlan_to_access_pods: {vlan_id: set of Access-Pod names}
+    device_campus_pod_map: {access_pod_name: campus_pod_name}"""
+    config_stub = studio_services.InputsConfigServiceStub(channel)
+
+    total_written = 0
+
+    for cpod_name in target_cpods:
+        pod_info = topology_pod_info.get(cpod_name)
+        if not pod_info:
+            print(f"    [!] Campus-Pod '{cpod_name}' not found in topology studio - skipping")
             continue
-        
-        for col in ['Access', 'Voice']:
-            val = clean_int_str(str(row.get(col, '')).strip())
-            if val and val.isdigit():
-                vlan = int(val)
-                if vlan != 1:
-                    required_vlans.add(vlan)
-        
-        profile = str(row.get('Port Profile', ''))
-        for m in re.findall(r'[AV](\d+)', profile):
-            vlan = int(m)
-            if vlan != 1:
-                required_vlans.add(vlan)
-    
-    missing = required_vlans - topology_vlans
-    
-    if missing:
-        print_done("FAILED")
-        print("\n" + "!"*80)
-        print("  CRITICAL VALIDATION FAILURE: MISSING VLANS IN TOPOLOGY")
-        print("!"*80)
-        print(f"\n  The following VLANs are not defined in the AVD Campus Topology studio:")
-        print(f"  {', '.join([str(v) for v in sorted(missing)])}")
-        print(f"\n  Please add these VLANs to the topology before configuring interfaces.")
-        print("!"*80)
-        return False
-    
-    print_done(f"Passed ({len(required_vlans)} VLANs verified)")
-    return True
+
+        c_idx = pod_info["campus_idx"]
+        cp_idx = pod_info["cpod_idx"]
+        existing_ids = pod_info["existing_vlan_ids"]
+        svi_offset = pod_info["svi_count"]
+
+        vlans_for_pod = {vid: name for vid, name in vlans_to_create.items() if vid not in existing_ids}
+
+        if not vlans_for_pod:
+            print(f"    {cpod_name}: all VLANs already exist")
+            continue
+
+        print(f"    {cpod_name}: writing {len(vlans_for_pod)} VLANs...")
+
+        for i, (vlan_id, vlan_name) in enumerate(sorted(vlans_for_pod.items())):
+            svi_idx = svi_offset + i
+
+            _write_svi_field(config_stub, ws_id, c_idx, cp_idx, svi_idx, "id", vlan_id)
+            _write_svi_field(config_stub, ws_id, c_idx, cp_idx, svi_idx, "name", vlan_name)
+            _write_svi_field(config_stub, ws_id, c_idx, cp_idx, svi_idx, "enabled", "Yes")
+
+            access_pods_for_vlan = [
+                ap for ap, cp in device_campus_pod_map.items()
+                if cp == cpod_name and vlan_id in vlan_to_access_pods.get(ap, set())
+            ]
+
+            if access_pods_for_vlan:
+                devices_array = []
+                for ap_name in sorted(access_pods_for_vlan):
+                    devices_array.append({
+                        "tagQuery": {"tags": {"query": format_tag_query("Access-Pod", ap_name)}},
+                        "ipVirtualRouterSubnet": None,
+                        "enabled": None
+                    })
+                _write_svi_field(config_stub, ws_id, c_idx, cp_idx, svi_idx, "devices", devices_array)
+
+            total_written += 1
+            print(f"      VLAN {vlan_id} ({vlan_name})")
+
+        print(f"    {cpod_name}: done")
+
+    return total_written
 
 def locate_pod_in_studio(grpc_channel, pod_name, existing_data, device_tags, device_campus_pod_map):
     """
@@ -530,33 +634,32 @@ def locate_pod_in_studio(grpc_channel, pod_name, existing_data, device_tags, dev
     return found_pods[0]
 
 def validate_vlans_in_topology(csv_data, topology_vlans):
-    """Validate that required VLANs exist in the AVD Campus Topology"""
-    import re
-    
+    """Validate that required VLANs exist in the AVD Campus Topology.
+    Returns (passed: bool, missing_vlans: set)."""
     print_step("Validating VLANs against topology design")
-    
+
     required_vlans = set()
-    
+
     for row in csv_data:
         mode_col = str(row.get('Mode', '')).strip().lower()
         if mode_col == "trunk":
             continue
-        
+
         for col in ['Access', 'Voice']:
             val = clean_int_str(str(row.get(col, '')).strip())
             if val and val.isdigit():
                 vlan = int(val)
                 if vlan != 1:
                     required_vlans.add(vlan)
-        
+
         profile = str(row.get('Port Profile', ''))
         for m in re.findall(r'[AV](\d+)', profile):
             vlan = int(m)
             if vlan != 1:
                 required_vlans.add(vlan)
-    
+
     missing = required_vlans - topology_vlans
-    
+
     if missing:
         print_done("FAILED")
         print("\n" + "!"*80)
@@ -564,51 +667,113 @@ def validate_vlans_in_topology(csv_data, topology_vlans):
         print("!"*80)
         print(f"\n  The following VLANs are not defined in the AVD Campus Topology studio:")
         print(f"  {', '.join([str(v) for v in sorted(missing)])}")
-        print(f"\n  Please add these VLANs to the topology before configuring interfaces.")
         print("!"*80)
-        return False
-    
+        return False, missing
+
     print_done(f"Passed ({len(required_vlans)} VLANs verified)")
-    return True
+    return True, set()
+
+def select_csv_file(prompt_label="Select CSV file", required_columns=None):
+    """Present CSV file picker and validate headers. Returns filepath or None."""
+    csv_dir = "./CSV"
+
+    while True:
+        csv_path = None
+
+        if os.path.exists(csv_dir):
+            csv_files = [f for f in os.listdir(csv_dir) if f.endswith('.csv')]
+            if csv_files:
+                print(f"\nAvailable CSV files in {csv_dir}:")
+                for i, f in enumerate(csv_files, 1):
+                    print(f"  [{i}] {f}")
+
+                choice = input(f"\n{prompt_label} [1-{len(csv_files)}]: ").strip()
+                try:
+                    csv_idx = int(choice) - 1
+                    if 0 <= csv_idx < len(csv_files):
+                        csv_path = os.path.join(csv_dir, csv_files[csv_idx])
+                    else:
+                        print("Invalid choice")
+                        return None
+                except:
+                    print("Invalid input")
+                    return None
+            else:
+                print(f"\nNo CSV files found in {csv_dir}")
+                csv_path = input("Enter CSV file path: ").strip()
+        else:
+            print(f"\nCSV directory not found: {csv_dir}")
+            csv_path = input("Enter CSV file path: ").strip()
+
+        if not os.path.exists(csv_path):
+            print(f"File not found: {csv_path}")
+            return None
+
+        if required_columns:
+            with open(csv_path) as f:
+                reader = csv.DictReader(f)
+                headers = set(reader.fieldnames or [])
+            missing = [c for c in required_columns if c not in headers]
+            if missing:
+                print(f"\n  [!] CSV is missing required columns: {', '.join(missing)}")
+                print(f"      Found columns: {', '.join(sorted(headers))}")
+                print(f"      Is this the right file?")
+                retry = input("\n  Select a different file? (y/n): ").strip().lower()
+                if retry == 'y':
+                    continue
+                return None
+
+        print(f"\nUsing CSV: {csv_path}")
+        return csv_path
+
+def read_vlan_csv(filepath):
+    """Read VLAN CSV and return {vlan_id (int): name (str)}."""
+    with open(filepath) as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames or []
+
+        id_col = None
+        name_col = None
+        for h in headers:
+            hl = h.lower()
+            if id_col is None and ('vlan' in hl or 'id' in hl):
+                id_col = h
+            if name_col is None and 'name' in hl:
+                name_col = h
+
+        if not id_col or not name_col:
+            print(f"  [!] Could not detect VLAN ID and Name columns")
+            print(f"      Found columns: {', '.join(headers)}")
+            return None
+
+        print(f"  Using columns: ID='{id_col}', Name='{name_col}'")
+
+        vlan_map = {}
+        for row in reader:
+            # 1. Extract string, convert to lowercase
+            raw_id_str = str(row.get(id_col, '')).lower()
+            
+            # 2. Remove the word 'vlan' and strip any leftover spaces (e.g. "vlan 10" -> "10")
+            raw_id_str = raw_id_str.replace('vlan', '').strip()
+            
+            # 3. Pass the cleaned string into your existing function
+            raw_id = clean_int_str(raw_id_str)
+            
+            name = str(row.get(name_col, '')).strip()
+            
+            if raw_id and raw_id.isdigit() and name:
+                vlan_map[int(raw_id)] = name
+
+        return vlan_map
 
 def main():
-    import os
-    
     print_header("ARISTA IMPORTER")
-    
-    csv_dir = "./CSV"
-    CSV_FILE = None
-    
-    if os.path.exists(csv_dir):
-        csv_files = [f for f in os.listdir(csv_dir) if f.endswith('.csv')]
-        if csv_files:
-            print(f"\nAvailable CSV files in {csv_dir}:")
-            for i, f in enumerate(csv_files, 1):
-                print(f"  [{i}] {f}")
-            
-            choice = input(f"\nSelect CSV file [1-{len(csv_files)}]: ").strip()
-            try:
-                csv_idx = int(choice) - 1
-                if 0 <= csv_idx < len(csv_files):
-                    CSV_FILE = os.path.join(csv_dir, csv_files[csv_idx])
-                else:
-                    print("Invalid choice")
-                    return
-            except:
-                print("Invalid input")
-                return
-        else:
-            print(f"\nNo CSV files found in {csv_dir}")
-            CSV_FILE = input("Enter CSV file path: ").strip()
-    else:
-        print(f"\nCSV directory not found: {csv_dir}")
-        CSV_FILE = input("Enter CSV file path: ").strip()
-    
-    if not os.path.exists(CSV_FILE):
-        print(f"File not found: {CSV_FILE}")
+
+    INTERFACE_CSV_COLUMNS = ['New_Switch', 'Port', 'Mode', 'Port Profile', 'Access']
+    CSV_FILE = select_csv_file("Select interface CSV file", required_columns=INTERFACE_CSV_COLUMNS)
+    if not CSV_FILE:
         return
-    
-    print(f"\nUsing CSV: {CSV_FILE}\n")
+    print()
     
     grpc_channel = get_grpc_channel()
     
@@ -711,13 +876,116 @@ def main():
         return
 
     print_header("PHASE 2.5: VLAN VALIDATION")
-    
+
     print_step("Reading VLANs from topology studio")
     topology_vlans = get_vlans_from_topology_studio(grpc_channel)
     print_done(f"({len(topology_vlans)} VLANs defined)")
-    
-    if not validate_vlans_in_topology(csv_data, topology_vlans):
-        print("\n    Aborting due to missing VLANs")
+
+    vlans_ok, missing_vlans = validate_vlans_in_topology(csv_data, topology_vlans)
+    if not vlans_ok:
+        print(f"\n  Would you like to create these {len(missing_vlans)} VLANs from a CSV?")
+        answer = input("  (y/n): ").strip().lower()
+        if answer != 'y':
+            print("\n    Aborting due to missing VLANs")
+            return
+
+        vlan_csv = select_csv_file("Select VLAN CSV file")
+        if not vlan_csv:
+            return
+
+        vlan_map = read_vlan_csv(vlan_csv)
+        if vlan_map is None:
+            return
+
+        creatable = {v: vlan_map[v] for v in missing_vlans if v in vlan_map}
+        uncreatable = missing_vlans - set(vlan_map.keys())
+
+        if creatable:
+            print(f"\n  VLANs to create ({len(creatable)}):")
+            for vid in sorted(creatable):
+                print(f"    VLAN {vid:>4} → {creatable[vid]}")
+
+        if uncreatable:
+            print(f"\n" + "!"*80)
+            print(f"  WARNING: {len(uncreatable)} missing VLANs not found in VLAN CSV:")
+            print(f"  {', '.join([str(v) for v in sorted(uncreatable)])}")
+            print(f"  These VLANs must be added manually before interface import.")
+            print("!"*80)
+            print("\n    Aborting - all missing VLANs must be resolvable")
+            return
+
+        access_pod_vlans = defaultdict(set)
+        for row in csv_data:
+            mode_col = str(row.get('Mode', '')).strip().lower()
+            if mode_col == "trunk":
+                continue
+            switch = str(row['New_Switch']).strip()
+            matches = find_devices_by_hostname(device_tags, switch)
+            if not matches:
+                continue
+            _, tags = matches[0]
+            ap_name = tags.get('Access-Pod', 'Unknown')
+            for col in ['Access', 'Voice']:
+                val = clean_int_str(str(row.get(col, '')).strip())
+                if val and val.isdigit():
+                    vlan = int(val)
+                    if vlan != 1:
+                        access_pod_vlans[ap_name].add(vlan)
+            profile = str(row.get('Port Profile', ''))
+            for m in re.findall(r'[AV](\d+)', profile):
+                vlan = int(m)
+                if vlan != 1:
+                    access_pod_vlans[ap_name].add(vlan)
+
+        target_cpods = set(device_campus_pod_map.values())
+
+        print_step("Reading topology studio structure")
+        topology_pod_info = get_topology_pod_structure(grpc_channel)
+        print_done(f"({len(topology_pod_info)} campus pods found)")
+
+        matched_cpods = target_cpods & set(topology_pod_info.keys())
+        unmatched_cpods = target_cpods - set(topology_pod_info.keys())
+
+        if unmatched_cpods:
+            print(f"\n  [!] WARNING: These Campus-Pods were not found in topology studio:")
+            for cp in sorted(unmatched_cpods):
+                print(f"      {cp}")
+
+        if not matched_cpods:
+            print("\n  [!] ERROR: No matching Campus-Pods found in topology studio")
+            return
+
+        print(f"\n  Target Campus-Pods: {', '.join(sorted(matched_cpods))}")
+        confirm = input(f"\n  Proceed with VLAN creation? (y/n): ").strip().lower()
+        if confirm != 'y':
+            return
+
+        print_header("VLAN CREATION")
+
+        print_step("Creating workspace")
+        ws_id = create_workspace(grpc_channel)
+        print_done(f"({ws_id[:8]})")
+
+        total = create_vlans_in_topology(grpc_channel, ws_id, creatable, topology_pod_info,
+                                          matched_cpods, access_pod_vlans, device_campus_pod_map)
+
+        print_step("Triggering build")
+        ws_stub = workspace_services.WorkspaceConfigServiceStub(grpc_channel)
+        ws_stub.Set(workspace_services.WorkspaceConfigSetRequest(value=workspace_pb2.WorkspaceConfig(
+            key=workspace_pb2.WorkspaceKey(workspace_id=wrappers.StringValue(value=ws_id)),
+            request=1,
+            request_params=workspace_pb2.RequestParams(request_id=wrappers.StringValue(value=str(uuid.uuid4())))
+        )))
+        print_done()
+
+        print_header("VLAN CREATION COMPLETE")
+        print(f"  Workspace: https://{CV_ADDR}/cv/provisioning/workspaces?ws={ws_id}")
+        print(f"  VLANs written: {total}")
+        print(f"\n  Next steps:")
+        print(f"    1. Open the workspace URL above")
+        print(f"    2. Review the VLAN changes in the topology studio")
+        print(f"    3. Submit the workspace and execute the Change Control")
+        print(f"    4. Re-run this script to continue with the interface import")
         return
     
     print_header("PHASE 3: LOCATE PODS IN STUDIO")
